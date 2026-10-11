@@ -1,7 +1,0 @@
-﻿Output file E:\Work\ssd-cache-manager\build\SSDCacheManager-20261011-141347.exe written
-BUILD ERROR: [safe-delete][SAFE_DELETE_FAIL_CLOSED] {"target":"E:\\Work\\ssd-cache-manager\\build\\SSDCacheManager-20261011-141347.exe.win32manifest","reason":"trash-failed","detail":"ERROR E:\\Work\\ssd-cache-manager\\build\\SSDCacheManager-20261011-141347.exe.win32manifest: Error during a `trash` operation: Unknown { description: \"Some operations were aborted\" }"}
---- build 目录 ---
-  SSDCacheManager-20261011-141347.exe  123.5 KB  2026/10/11 14:13:47
-  SSDCacheManager-src.ps1  90.5 KB  2026/10/11 14:13:47
-  SSDCacheManager.exe  123 KB  2026/10/11 14:05:04
-  SSDCacheManager.exe.win32manifest  0.4 KB  2026/10/11 14:12:46
