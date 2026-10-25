@@ -32,6 +32,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# $PSScriptRoot can come through empty under some nested-host invocations
+# (seen when the build is launched by another PowerShell process), which then
+# fails much later with an unrelated "empty string" Path binding error.
+if (-not $ProjectRoot) { $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $ProjectRoot) { throw '$ProjectRoot could not be determined; pass -ProjectRoot explicitly.' }
+
 $guiPath = Join-Path $ProjectRoot 'SSDCacheGUI.ps1'
 $libPath = Join-Path $ProjectRoot 'SSDCacheLib.psm1'
 $outDir  = Join-Path $ProjectRoot 'build'

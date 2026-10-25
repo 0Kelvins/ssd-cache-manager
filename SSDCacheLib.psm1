@@ -72,6 +72,60 @@ function Get-DirSize {
     return [int64]$sum
 }
 
+function Get-DirStats {
+    <#
+      Size, file count and the most recently written file of a tree, in one
+      pass. NewestFile is the relative path used by the GUI to show which file
+      robocopy is currently writing (robocopy offers no per-file callback).
+    #>
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    $stats = [pscustomobject]@{ SizeBytes = [int64]0; FileCount = [int64]0; NewestFile = '' }
+    if ([string]::IsNullOrWhiteSpace($LiteralPath)) { return $stats }
+    if (-not (Test-Path -LiteralPath $LiteralPath)) { return $stats }
+
+    $item = Get-Item -LiteralPath $LiteralPath -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return $stats }
+    if (-not $item.PSIsContainer) {
+        $stats.SizeBytes = [int64]$item.Length
+        $stats.FileCount = [int64]1
+        $stats.NewestFile = $item.Name
+        return $stats
+    }
+
+    try {
+        $files = Get-ChildItem -LiteralPath $LiteralPath -Recurse -File -Force -ErrorAction SilentlyContinue
+    } catch {
+        return $stats
+    }
+    $all = @($files)
+    if ($all.Count -eq 0) { return $stats }
+
+    $sum = ($all | Measure-Object -Property Length -Sum).Sum
+    if ($null -ne $sum) { $stats.SizeBytes = [int64]$sum }
+    $stats.FileCount = [int64]$all.Count
+
+    $newest = $null
+    $newestTime = [datetime]::MinValue
+    foreach ($f in $all) {
+        try {
+            # CreationTime, not LastWriteTime: robocopy preserves the source
+            # timestamp, so LastWriteTime tells nothing about copy order while
+            # the destination creation time does.
+            if ($f.CreationTime -gt $newestTime) { $newestTime = $f.CreationTime; $newest = $f.FullName }
+        } catch { }
+    }
+    if ($newest) {
+        $rootNorm = $LiteralPath.TrimEnd('\')
+        if ($newest.Length -gt $rootNorm.Length) {
+            $stats.NewestFile = $newest.Substring($rootNorm.Length).TrimStart('\')
+        } else {
+            $stats.NewestFile = [IO.Path]::GetFileName($newest)
+        }
+    }
+    return $stats
+}
+
 function Get-FreeBytes {
     param([Parameter(Mandatory)][string]$DriveLetter)
     try {
@@ -202,6 +256,44 @@ function Remove-CacheFolderSafe {
     }
 
     return (-not (Test-Path -LiteralPath $LiteralPath))
+}
+
+function Remove-LeakedMarkers {
+    <#
+      Deletes our .ssdcache_root marker files anywhere under a user folder.
+
+      Needed because promoting a parent folder merges previously cached
+      children into one tree; their nested markers then travel back with the
+      data on demote. Ownership is verified per file (Tool must be
+      SSDCacheManager) so an unrelated file of the same name is never touched.
+    #>
+    param([Parameter(Mandatory)][string]$Root)
+
+    $removed = 0
+    if ([string]::IsNullOrWhiteSpace($Root)) { return $removed }
+    if (-not (Test-Path -LiteralPath $Root)) { return $removed }
+
+    $files = @()
+    try {
+        $files = @(Get-ChildItem -LiteralPath $Root -Recurse -Force -File -Filter $script:MarkerName -ErrorAction SilentlyContinue)
+    } catch {
+        return $removed
+    }
+
+    foreach ($f in $files) {
+        $mine = $false
+        try {
+            $m = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop | ConvertFrom-Json
+            if ($m.Tool -eq 'SSDCacheManager') { $mine = $true }
+        } catch {
+            $mine = $false
+        }
+        if ($mine) {
+            # .NET API: endpoint protection vetoes Remove-Item on bookkeeping files.
+            try { [System.IO.File]::Delete($f.FullName); $removed++ } catch { }
+        }
+    }
+    return $removed
 }
 
 function Remove-EmptyParents {
@@ -422,9 +514,13 @@ function Invoke-CachePromote {
     }
 
     $cachePath = Get-CachePathFor -SourcePath $src -Root $CacheRoot
-    if (Test-Path -LiteralPath $cachePath) {
-        throw ("Cache target already exists. Demote or remove it first: {0}" -f $cachePath)
-    }
+    # NOTE: an existing $cachePath is allowed on purpose, two legitimate cases:
+    #   1) a previous promote of this very path was interrupted (resume merge);
+    #   2) child folders were promoted earlier - their cache dirs live UNDER
+    #      this path, because Get-CachePathFor nests children inside the
+    #      parent (e.g. E:\SSDCache\F\Books\DataMining).
+    # robocopy /E /MOVE is additive: it only adds files from the source and
+    # never touches what is already in the cache.
 
     $size = Get-DirSize -LiteralPath $src
     $cacheDrive = ([IO.Path]::GetPathRoot($CacheRoot)).TrimEnd('\').TrimEnd(':')
@@ -449,10 +545,33 @@ function Invoke-CachePromote {
     New-MarkerFile -CachePath $cachePath -OriginalPath $src
 
     # robocopy /MOVE leaves an empty shell behind; remove it before mklink.
+    # Child junctions pointing INSIDE our own cache path are safe to delete:
+    # their data already lives under $cachePath, and once this junction is
+    # created they resolve to the identical location through the parent.
+    # Without this, promoting a parent folder over already-cached children
+    # fails because the shell never becomes empty ("directory not empty").
     if (Test-Path -LiteralPath $src) {
+        $kids = @(Get-ChildItem -LiteralPath $src -Force -ErrorAction SilentlyContinue)
+        foreach ($k in $kids) {
+            if (($k.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $kt = $null
+                try { $kt = Get-JunctionTarget -LiteralPath $k.FullName } catch { $kt = $null }
+                if ($kt -and $kt.StartsWith($cachePath, [StringComparison]::OrdinalIgnoreCase)) {
+                    # .NET API, not Remove-Item: endpoint protection vetoes the
+                    # cmdlet on reparse points, exactly as documented for the
+                    # demote path. Directory.Delete(path, false) removes only
+                    # the reparse point, never the target.
+                    try { [System.IO.Directory]::Delete($k.FullName, $false) } catch { }
+                }
+            }
+        }
         $left = @(Get-ChildItem -LiteralPath $src -Force -ErrorAction SilentlyContinue)
         if ($left.Count -eq 0) {
-            Remove-Item -LiteralPath $src -Force -Recurse -ErrorAction SilentlyContinue
+            try { Remove-Item -LiteralPath $src -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+            # Same veto risk as above; fall back to the .NET API.
+            if (Test-Path -LiteralPath $src) {
+                try { [System.IO.Directory]::Delete($src, $false) } catch { }
+            }
         }
     }
 
@@ -461,10 +580,30 @@ function Invoke-CachePromote {
     } catch {
         # roll data back to the original location
         $rb = Invoke-RoboMove -From $cachePath -To $src -LogPath $logPath
+        $keptLeftovers = $false
         if ($rb.Success) {
-            Remove-Item -LiteralPath $cachePath -Recurse -Force -ErrorAction SilentlyContinue
+            # NEVER delete a cache tree that still holds files. When the source
+            # contains junctions pointing into $cachePath (a parent folder whose
+            # children were promoted earlier), the write-back cannot move that
+            # data and a blind Remove-Item -Recurse destroys it.
+            $leftFiles = @(Get-ChildItem -LiteralPath $cachePath -Recurse -File -Force -ErrorAction SilentlyContinue)
+            if ($leftFiles.Count -eq 0) {
+                Remove-Item -LiteralPath $cachePath -Recurse -Force -ErrorAction SilentlyContinue
+            } else {
+                $keptLeftovers = $true
+            }
         }
-        throw ("Could not create the junction; data was rolled back to {0}. Underlying error: {1}" -f $src, $_.Exception.Message)
+        # Do not leave our bookkeeping file in the user's folder.
+        $leakedMarker = Join-Path $src $script:MarkerName
+        if ((Test-Path -LiteralPath $leakedMarker) -and -not (Test-Junction -LiteralPath $src)) {
+            try { Remove-Item -LiteralPath $leakedMarker -Force -ErrorAction SilentlyContinue } catch { }
+        }
+        $note = ''
+        if ($keptLeftovers) {
+            $note = (' Some data could not be written back and was KEPT in the cache: {0}. Do not delete it.' -f $cachePath)
+            Write-Warning $note
+        }
+        throw ("Could not create the junction; data was rolled back to {0}.{1} Underlying error: {2}" -f $src, $note, $_.Exception.Message)
     }
 
     if (-not (Test-Junction -LiteralPath $src)) {
@@ -499,7 +638,7 @@ function Invoke-CacheDemote {
 
     $cachePath = Get-JunctionTarget -LiteralPath $src
     if (-not $cachePath -or -not (Test-Path -LiteralPath $cachePath)) {
-        throw ("Junction target is missing; inspect manually: {0}" -f $src)
+        throw ("Junction target is missing: {0} (target: {1}). The cached data is gone. Remove the broken junction with: (Get-Item -LiteralPath '{0}' -Force).Delete() - this cannot delete data because the target no longer exists. Then restore the folder from a backup." -f $src, $cachePath)
     }
 
     $size = Get-DirSize -LiteralPath $cachePath
@@ -556,11 +695,10 @@ function Invoke-CacheDemote {
         throw ("Write-back failed (robocopy code {0}). Data is safe in the cache at {1}. To restore access run: {2}" -f $mv.Code, $cachePath, $rebuild)
     }
 
-    # 4) Safety net: never leave our marker in the user's folder.
-    $leaked = Join-Path $src $script:MarkerName
-    if (Test-Path -LiteralPath $leaked) {
-        try { Remove-Item -LiteralPath $leaked -Force -ErrorAction SilentlyContinue } catch { }
-    }
+    # 4) Safety net: never leave our marker files in the user's folder.
+    #    Nested markers appear when a parent was promoted on top of already
+    #    cached children - their markers sit inside the merged tree.
+    $null = Remove-LeakedMarkers -Root $src
 
     # 5) Verify before deleting the cache copy. After a successful /MOVE the
     #    cache tree may already be gone, so probe existence before enumerating.
@@ -591,6 +729,12 @@ function Invoke-CacheDemote {
     # 7) Prune empty folders left inside the cache root.
     $pruned = @()
     if ($CacheRoot) { $pruned = Remove-EmptyParents -StartDir (Split-Path -Parent $cachePath) -Root $CacheRoot }
+
+    # 8) The parked marker is scratch state; drop it so the cache root does not
+    #    accumulate ssdcache_marker_*.json files across demote operations.
+    if ($markerParked) {
+        try { if (Test-Path -LiteralPath $markerParked) { [System.IO.File]::Delete($markerParked) } } catch { }
+    }
 
     $msg = ('Demoted. {0} GB restored to {1}.' -f [math]::Round($size / 1GB, 3), $homeDrive)
     if ($cacheCleanupError) {
@@ -636,8 +780,10 @@ Export-ModuleMember -Function @(
     'Test-Administrator',
     'Get-DriveRoots',
     'Get-DirSize',
+    'Get-DirStats',
     'Get-FreeBytes',
     'Get-JunctionTarget',
+    'Get-CachePathFor',
     'Get-ChildDirectories',
     'Get-JunctionInventory',
     'Get-CacheStatus',

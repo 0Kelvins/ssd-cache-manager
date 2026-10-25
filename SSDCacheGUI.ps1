@@ -102,7 +102,22 @@ $script:OpLastSizeAt    = [DateTime]::MinValue
 $script:OpMode          = ''      # Promote / Demote
 $script:OpCacheRoot     = ''
 $script:OpTotalBytes    = [int64]0
-$script:OpMeas          = @{ Busy = $false; PS = $null; Ar = $null; CachePath = $null; DoneBytes = [int64]0; LastShown = '' }
+$script:OpTotalFiles    = [int64]0   # 全部所选目录的文件总数（全局文件进度用）
+$script:OpPaths         = $null   # 当前任务路径列表（手动终止后续传用）
+$script:OpSizes         = $null
+$script:OpCounts        = $null   # 各路径的文件总数（逐文件进度用）
+$script:OpResumePaths   = $null   # 手动终止时正在处理的目录（显式续传候选）
+$script:OpStopping      = $false  # 防止「终止任务」按钮重入
+$script:OpMeasLogged    = $false  # 进度测量异常只记一次日志
+$script:OpMeasStartLogged = $false # 首次启动测量时记一条日志（确认链路已通）
+$script:OpCurDirText    = ''      # 当前目录序号文本，如 "[1/1] F:\Game\X"
+$script:OpCurDirPath    = ''      # 当前目录源路径（测量路径的兜底推导用）
+$script:OpMeas          = @{ Busy = $false; PS = $null; Ar = $null; CachePath = $null; SizeBytes = [int64]0; FileTotal = [int64]0; FilesDoneBase = [int64]0; DoneBytes = [int64]0; LatestFile = ''; LastShown = '' }
+
+# 版本号：同时写进标题栏与启动日志。
+# 目的：远程排查时先确认"跑的是哪个构建"——否则改了几轮仍在看旧进程，
+# 会被现象误导。见 2026-10-25 的「已完成 1/1」排查。
+$script:AppVersion = '1.1'
 
 # 后台扫描执行状态（同理：必须顶层预初始化）
 $script:ScanPS          = $null
@@ -114,6 +129,8 @@ $script:StatusText = @{
     'Cached'        = '已缓存'
     'TargetMissing' = '目标丢失'
     'System'        = '系统联接'
+    'Caching'       = '正在缓存'
+    'Demoting'      = '正在回写'
 }
 
 #region 辅助
@@ -202,6 +219,15 @@ function Write-Log {
 function Format-SizeGB {
     param([double]$Bytes)
     return ('{0:N2} GB' -f ($Bytes / 1GB))
+}
+
+function Format-ShortName {
+    <# 超长文件名中间省略，保留首尾以便辨认。 #>
+    param([string]$Name, [int]$Max = 60)
+    if ([string]::IsNullOrEmpty($Name)) { return '' }
+    if ($Name.Length -le $Max) { return $Name }
+    $keep = [int](($Max - 1) / 2)
+    return ($Name.Substring(0, $keep) + '…' + $Name.Substring($Name.Length - $keep))
 }
 
 #endregion
@@ -301,6 +327,22 @@ function Initialize-Controls {
     $btnDemote.Add_Click({ Invoke-DemoteSelected })
     $script:BtnDemote = $btnDemote
 
+    # 手动终止：放在进度条面板右侧，用 × 表示；仅操作期间可见/可用。
+    # 终止后自动从断点续传，不丢数据。
+    $btnStop = New-Object System.Windows.Forms.Button
+    $btnStop.Text = [string][char]0x00D7
+    $btnStop.Width = 34
+    $btnStop.Height = 22
+    $btnStop.Dock = 'Right'
+    $btnStop.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnStop.FlatAppearance.BorderSize = 0
+    $btnStop.BackColor = [System.Drawing.Color]::FromArgb(255, 224, 178)
+    $btnStop.ForeColor = [System.Drawing.Color]::Firebrick
+    $btnStop.Font = New-Object System.Drawing.Font('微软雅黑', 10.5, [System.Drawing.FontStyle]::Bold)
+    $btnStop.Enabled = $false
+    $btnStop.Add_Click({ Invoke-StopOperationManual })
+    $script:BtnStop = $btnStop
+
     # ---- 标签 ----
     $lblCacheRoot = New-Object System.Windows.Forms.Label
     $lblCacheRoot.Text = '缓存根目录:'
@@ -373,23 +415,63 @@ function Initialize-Controls {
     $bottomPanel.Padding = New-Object System.Windows.Forms.Padding(6, 0, 6, 6)
     $bottomPanel.Controls.Add($script:LogBox)
 
-    # 进度条 + 状态文字（提升/回写长任务时显示）
+    # 状态明细行（进度条下方：目录序号 + 路径 + 正在复制的文件名）
+    # AutoSize 必须显式关闭：Label 默认 AutoSize=true，与 Dock 组合时会被
+    # 文本尺寸覆盖，导致整行高度塌陷、文字不可见。
     $script:OpStatusLabel = New-Object System.Windows.Forms.Label
-    $script:OpStatusLabel.Dock = 'Right'
-    $script:OpStatusLabel.Width = 380
+    $script:OpStatusLabel.AutoSize = $false
+    $script:OpStatusLabel.Dock = 'Bottom'
+    $script:OpStatusLabel.Height = 20
     $script:OpStatusLabel.TextAlign = 'MiddleLeft'
-    $script:OpStatusLabel.Font = New-Object System.Drawing.Font('微软雅黑', 8.5)
-    $script:OpStatusLabel.ForeColor = [System.Drawing.Color]::DarkSlateBlue
+    $script:OpStatusLabel.Font = New-Object System.Drawing.Font('微软雅黑', 8)
+    $script:OpStatusLabel.ForeColor = [System.Drawing.Color]::DimGray
+    $script:OpStatusLabel.BackColor = [System.Drawing.Color]::WhiteSmoke
+    $script:OpStatusLabel.Text = '准备中…'
 
+    # 进度行：进度条（填充）+ 百分比（右）+ × 终止（最右）
     $script:ProgressBar = New-Object System.Windows.Forms.ProgressBar
     $script:ProgressBar.Dock = 'Fill'
     $script:ProgressBar.Height = 22
 
-    $script:ProgressPanel = New-Object System.Windows.Forms.Panel
+    $script:PercentLabel = New-Object System.Windows.Forms.Label
+    $script:PercentLabel.Dock = 'Right'
+    $script:PercentLabel.Width = 56
+    $script:PercentLabel.TextAlign = 'MiddleRight'
+    $script:PercentLabel.Font = New-Object System.Drawing.Font('Consolas', 9.5, [System.Drawing.FontStyle]::Bold)
+    $script:PercentLabel.ForeColor = [System.Drawing.Color]::DarkSlateBlue
+    $script:PercentLabel.Text = ''
+
+    # 合计进度：字节 + 文件数（全部所选目录的累计）
+    $script:CountLabel = New-Object System.Windows.Forms.Label
+    $script:CountLabel.Dock = 'Right'
+    $script:CountLabel.Width = 250
+    $script:CountLabel.TextAlign = 'MiddleRight'
+    $script:CountLabel.Font = New-Object System.Drawing.Font('微软雅黑', 8)
+    $script:CountLabel.ForeColor = [System.Drawing.Color]::DimGray
+    $script:CountLabel.Text = ''
+
+    $script:ProgressRow = New-Object System.Windows.Forms.Panel
+    $script:ProgressRow.Dock = 'Fill'
+    $script:ProgressRow.Height = 24
+    $script:ProgressRow.Controls.Add($script:ProgressBar)
+    $script:ProgressRow.Controls.Add($script:PercentLabel)
+    $script:ProgressRow.Controls.Add($script:CountLabel)
+    # × 最后加入：停靠按加入的逆序布局，最后加入者最先停靠（最右缘）
+    $script:ProgressRow.Controls.Add($btnStop)
+
+    # 两行固定高度的 TableLayoutPanel：彻底避开 Label.AutoSize 与 Dock 的
+    # 布局歧义（AutoSize 会覆盖 Fill，导致明细行挤到进度条同一行）。
+    $script:ProgressPanel = New-Object System.Windows.Forms.TableLayoutPanel
     $script:ProgressPanel.Dock = 'Top'
-    $script:ProgressPanel.Height = 26
-    $script:ProgressPanel.Controls.Add($script:ProgressBar)
-    $script:ProgressPanel.Controls.Add($script:OpStatusLabel)
+    $script:ProgressPanel.Height = 48
+    $script:ProgressPanel.ColumnCount = 1
+    $script:ProgressPanel.RowCount = 2
+    $null = $script:ProgressPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 26)))
+    $null = $script:ProgressPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 22)))
+    $script:ProgressRow.Dock = 'Fill'
+    $script:OpStatusLabel.Dock = 'Fill'
+    $script:ProgressPanel.Controls.Add($script:ProgressRow, 0, 0)
+    $script:ProgressPanel.Controls.Add($script:OpStatusLabel, 0, 1)
     $script:ProgressPanel.Visible = $false
 
     $bottomPanel.Controls.Add($script:ProgressPanel)
@@ -428,7 +510,8 @@ function Initialize-Controls {
     $rootPanel.Controls.Add($script:LblDrives)
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = 'SSD 缓存管理器（基于目录联接，兼容内核隔离）'
+    # 标题带版本号：远程排查时第一眼就能确认运行的是哪个构建。
+    $form.Text = ('SSD 缓存管理器 v{0}（基于目录联接，兼容内核隔离）' -f $script:AppVersion)
     $form.Width = 1200
     $form.Height = 780
     $form.StartPosition = 'CenterScreen'
@@ -633,6 +716,7 @@ function Test-ScanCompletion {
             Write-Log ("扫描完成：{0} 个缓存目录，共 {1}。" -f $found.Count, (Format-SizeGB $total))
         }
         Update-InventoryUi -Items $found
+        if (-not $errMsg) { Save-InventoryCache -Items $found }
     } catch {
         $state.ScanBusy = $false
         $script:Inventory.Enabled = $true
@@ -668,11 +752,13 @@ function Update-InventoryUi {
 
             $row = New-Object System.Windows.Forms.ListViewItem($f.Path)
             $null = $row.SubItems.Add($(if ($f.Target) { $f.Target } else { '（丢失）' }))
-            $null = $row.SubItems.Add((Format-SizeGB $f.SizeBytes))
-            $null = $row.SubItems.Add([string]$f.FileCount)
+            $isPending = ($f.Status -eq 'Caching' -or $f.Status -eq 'Demoting')
+            $null = $row.SubItems.Add($(if ($isPending) { '—' } else { Format-SizeGB $f.SizeBytes }))
+            $null = $row.SubItems.Add($(if ($isPending) { '—' } else { [string]$f.FileCount }))
             $null = $row.SubItems.Add($statusText)
             $row.Tag = $f
             if ($f.Status -eq 'TargetMissing') { $row.ForeColor = [System.Drawing.Color]::Firebrick }
+            elseif ($isPending) { $row.ForeColor = [System.Drawing.Color]::DarkOrange }
             elseif ($f.Status -eq 'System') { $row.ForeColor = [System.Drawing.Color]::Gray }
             $null = $script:Inventory.Items.Add($row)
         }
@@ -691,9 +777,179 @@ function Update-InventoryUi {
     }
 }
 
+#region 清单快照缓存
+
+function Get-InventoryCachePath {
+    <# 快照存放位置：%LOCALAPPDATA%\SSDCacheManager\inventory.json #>
+    $dir = Join-Path $env:LOCALAPPDATA 'SSDCacheManager'
+    try {
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    } catch { }
+    return (Join-Path $dir 'inventory.json')
+}
+
+function Save-InventoryCache {
+    <#
+      把扫描结果写入本地快照。下次启动先显示快照，避免每次等全量扫描。
+      仅保存展示所需字段，避免把无关对象序列化进文件。
+    #>
+    param([object[]]$Items)
+
+    try {
+        $rows = @()
+        foreach ($i in @($Items)) {
+            if ($null -eq $i) { continue }
+            $rows += [pscustomobject]@{
+                Path      = [string]$i.Path
+                Target    = $(if ($i.Target) { [string]$i.Target } else { $null })
+                SizeBytes = [int64]$i.SizeBytes
+                FileCount = [int64]$i.FileCount
+                IsValid   = [bool]$i.IsValid
+                Status    = [string]$i.Status
+            }
+        }
+        $payload = [pscustomobject]@{
+            SavedAt = (Get-Date).ToString('o')
+            Tool    = 'SSDCacheManager'
+            Version = '1.1'
+            Items   = $rows
+        }
+        ($payload | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath (Get-InventoryCachePath) -Encoding UTF8
+    } catch {
+        Write-Log ("写入缓存清单快照失败：" + $_.Exception.Message) '警告'
+    }
+}
+
+function Load-InventoryCache {
+    <#
+      读取快照并逐项做低成本校验：
+        - 路径已不是联接（已回写/被人工删除）        -> 丢弃
+        - 联接目标不可达（缓存盘未挂载/被移动）      -> 标记目标丢失
+      大目录大小沿用快照值，随后由后台全量扫描覆盖。
+    #>
+    $path = Get-InventoryCachePath
+    if (-not (Test-Path -LiteralPath $path)) { return @() }
+
+    $data = $null
+    try { $data = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json } catch { return @() }
+    if ($null -eq $data -or $null -eq $data.Items) { return @() }
+
+    $out = @()
+    foreach ($it in @($data.Items)) {
+        if ([string]::IsNullOrWhiteSpace([string]$it.Path)) { continue }
+        $isJ = $false
+        try { $isJ = Test-Junction -LiteralPath $it.Path } catch { $isJ = $false }
+        if (-not $isJ) { continue }
+        $targetOk = $false
+        try { $targetOk = [bool]($it.Target -and (Test-Path -LiteralPath $it.Target)) } catch { $targetOk = $false }
+        $out += [pscustomobject]@{
+            Path      = [string]$it.Path
+            Target    = $(if ($it.Target) { [string]$it.Target } else { $null })
+            SizeBytes = [int64]$it.SizeBytes
+            FileCount = [int64]$it.FileCount
+            IsValid   = $targetOk
+            Status    = $(if ($targetOk) { 'Cached' } else { 'TargetMissing' })
+        }
+    }
+    return $out
+}
+
+#endregion
+
 function Refresh-Inventory {
     <# 启动后台扫描（独立 runspace），立即返回。 #>
     Start-InventoryScan
+}
+
+function Add-InventoryPending {
+    <#
+      提升/回写开始时先把目标路径插入清单，状态为「正在缓存 / 正在回写」，
+      让用户立刻看到任务涉及哪些目录；完成后由 Complete-InventoryPending
+      改写为最终状态，再由后台扫描覆盖为权威结果。
+    #>
+    param([string]$Mode, [string[]]$Paths)
+
+    $root = $script:CacheRootBox.Text.Trim()
+    $pending = @()
+    foreach ($p in @($Paths)) {
+        if ([string]::IsNullOrWhiteSpace($p)) { continue }
+        $tgt = $null
+        try { if ($root) { $tgt = Get-CachePathFor -SourcePath $p -Root $root } } catch { $tgt = $null }
+        $pending += [pscustomobject]@{
+            Path      = [string]$p
+            Target    = $(if ($tgt) { [string]$tgt } else { $null })
+            SizeBytes = [int64]0
+            FileCount = 0
+            IsValid   = $true
+            Status    = $(if ($Mode -eq 'Promote') { 'Caching' } else { 'Demoting' })
+        }
+    }
+    if ($pending.Count -eq 0) { return }
+
+    # 同路径的旧行先移除，避免出现重复条目
+    $kept = @()
+    foreach ($e in @($state.Inventory)) {
+        $dup = $false
+        foreach ($i in $pending) { if ([string]$e.Path -eq $i.Path) { $dup = $true; break } }
+        if (-not $dup) { $kept += $e }
+    }
+    Update-InventoryUi -Items (@($pending) + $kept)
+}
+
+function Complete-InventoryPending {
+    <#
+      用任务结果收尾清单：
+        提升成功 -> 状态改为「已缓存」，大小取实际迁移量
+        提升失败 -> 移除占位行（数据未迁移）
+        回写成功 -> 移除该行（已不在缓存中）
+        回写失败 -> 保留
+      未出现在结果中的占位行一并清除，随后由扫描写入权威数据。
+    #>
+    param([string]$Mode, [object[]]$Results)
+
+    $inv = @($state.Inventory)
+    if ($inv.Count -eq 0) { return }
+
+    $byPath = @{}
+    foreach ($r in @($Results)) {
+        if ($null -eq $r) { continue }
+        $pp = $r.PSObject.Properties['Path']
+        if (-not $pp) { continue }
+        $byPath[[string]$pp.Value] = $r
+    }
+
+    $out = @()
+    foreach ($e in $inv) {
+        $key = [string]$e.Path
+        $isPending = ($e.Status -eq 'Caching' -or $e.Status -eq 'Demoting')
+
+        if (-not $byPath.ContainsKey($key)) {
+            if (-not $isPending) { $out += $e }
+            continue
+        }
+
+        $r = $byPath[$key]
+        $okProp = $r.PSObject.Properties['Success']
+        $ok = ($null -eq $okProp -or [bool]$okProp.Value)
+
+        if ($Mode -eq 'Demote') {
+            if ($ok) { continue }
+            $out += $e
+            continue
+        }
+
+        if (-not $ok) { continue }
+        $sizeProp = $r.PSObject.Properties['SizeBytes']
+        $out += [pscustomobject]@{
+            Path      = $key
+            Target    = $(if ($e.Target) { [string]$e.Target } else { $null })
+            SizeBytes = $(if ($sizeProp) { [int64]$sizeProp.Value } else { [int64]0 })
+            FileCount = [int64]$e.FileCount
+            IsValid   = $true
+            Status    = 'Cached'
+        }
+    }
+    Update-InventoryUi -Items $out
 }
 
 function Set-OpUi {
@@ -704,8 +960,100 @@ function Set-OpUi {
     $script:BtnDemoteOne.Enabled = -not $Busy
     $script:BtnRescan.Enabled = -not $Busy
     $script:BtnRefresh.Enabled = -not $Busy
+    $script:BtnStop.Enabled = $Busy
     $script:ProgressPanel.Visible = $Busy
-    if ($Busy) { $script:ProgressBar.Value = 0 }
+    if ($Busy) {
+        $script:ProgressBar.Value = 0
+        $script:PercentLabel.Text = '0%'
+        $script:CountLabel.Text = ''
+    }
+}
+
+function Reset-OpRuntime {
+    <# 停止并释放任务相关的全部后台资源（timer / worker / 测量 runspace）。 #>
+    try { if ($null -ne $script:OpTimer) { $script:OpTimer.Stop(); $script:OpTimer.Dispose() } } catch { }
+    try {
+        if ($null -ne $script:OpPS -and $script:OpPS.InvocationStateInfo.State -eq 'Running') { $script:OpPS.Stop() }
+        if ($null -ne $script:OpPS) { $script:OpPS.Dispose() }
+    } catch { }
+    try { if ($null -ne $script:OpMeas.PS) { $script:OpMeas.PS.Dispose() } } catch { }
+    $script:OpPS = $null
+    $script:OpAsyncResult = $null
+    $script:OpMeas.Busy = $false
+    $script:OpMeas.PS = $null
+    $script:OpMeas.Ar = $null
+    $script:OpMeas.CachePath = $null
+}
+
+function Invoke-StopOperationManual {
+    <#
+      手动终止当前任务，然后从断点自动续传。
+
+      直接杀 robocopy /MOVE 会让数据分居两侧（部分已复制到缓存、部分还在
+      源盘），因此终止不是终点：杀完进程后用同一批参数重新拉起任务，
+      worker 的续传分支会对每个目录做判定——
+        已是联接点        -> 秒级跳过（之前已完成）
+        源+缓存都有数据    -> robocopy /E /MOVE 幂等续传，补齐后建联接
+        全新目录          -> 正常提升/回写
+    #>
+    if (-not $state.OpBusy) { return }
+    if ($script:OpStopping) { return }
+
+    $modeText = $(if ($script:OpMode -eq 'Promote') { '提升' } else { '回写' })
+    $ans = [System.Windows.Forms.MessageBox]::Show(
+        ("将终止当前的{0}任务。`n`n数据安全流程：`n1. 停止任务并结束复制进程；`n2. 自动从断点续传：已复制部分保留，剩余部分补齐后建立联接（提升）或完成写回（回写）；`n3. 不会丢失任何数据。`n`n是否终止？" -f $modeText),
+        '终止任务', [System.Windows.Forms.MessageBoxButtons]::OKCancel, [System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($ans -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+    $script:OpStopping = $true
+    try {
+        Write-Log '正在终止任务……' '警告'
+        # 1) 请求 worker 管线停止
+        try {
+            if ($null -ne $script:OpPS -and $script:OpPS.InvocationStateInfo.State -eq 'Running') { $script:OpPS.Stop() }
+        } catch { }
+
+        # 2) 按命令行里的日志路径精确匹配本操作的 robocopy 并结束。
+        #    管线完全停下之前 worker 可能又拉起一个新的 robocopy，
+        #    因此循环清除直到连续一轮无匹配。
+        $logFile = ''
+        if ($script:OpCacheRoot) { $logFile = Join-Path $script:OpCacheRoot 'ssdcache.log' }
+        if ($logFile) {
+            for ($attempt = 0; $attempt -lt 6; $attempt++) {
+                $killed = $false
+                $procs = @()
+                try { $procs = @(Get-CimInstance Win32_Process -Filter "Name = 'robocopy.exe'" -ErrorAction Stop) } catch { }
+                foreach ($proc in $procs) {
+                    if ($proc.CommandLine -and $proc.CommandLine.Contains($logFile)) {
+                        try {
+                            Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+                            $killed = $true
+                            Write-Log ("已结束复制进程 (PID {0})。" -f $proc.ProcessId) '警告'
+                        } catch { }
+                    }
+                }
+                if (-not $killed) { break }
+                Start-Sleep -Milliseconds 400
+            }
+        }
+
+        # 3) 复位运行时并重启同一任务（续传接管）
+        Reset-OpRuntime
+        $state.OpBusy = $false
+        $script:OpStatusLabel.Text = '已手动终止，正在从断点恢复……'
+    } finally {
+        $script:OpStopping = $false
+    }
+
+    # 从进度文本解析被中断的目录，作为显式续传候选
+    $resumePaths = $null
+    if ($script:OpCurDirText) {
+        $cand = ($script:OpCurDirText -replace '^\[[^\]]+\]\s*', '' -replace '^续传\s*', '')
+        if ($cand) { $resumePaths = @($cand) }
+    }
+
+    Write-Log ('正在从断点恢复{0}任务（已完成目录自动跳过，被中断目录补齐数据）……' -f $modeText) '警告'
+    Start-Operation -Mode $script:OpMode -Paths $script:OpPaths -Root $script:OpCacheRoot -Sizes $script:OpSizes -Counts $script:OpCounts -TotalBytes $script:OpTotalBytes -ResumePaths $resumePaths
 }
 
 function Start-Operation {
@@ -721,21 +1069,37 @@ function Start-Operation {
         [Parameter(Mandatory)][string[]]$Paths,
         [Parameter(Mandatory)][string]$Root,
         [long[]]$Sizes,
-        [long]$TotalBytes = 0
+        [long[]]$Counts,
+        [long]$TotalBytes = 0,
+        [string[]]$ResumePaths
     )
 
     if ($state.OpBusy) { Write-Log '已有任务在执行。' '警告'; return }
     $state.OpBusy = $true
     $script:OpMode = $Mode
     $script:OpCacheRoot = $Root
+    $script:OpPaths = $Paths
+    $script:OpSizes = $Sizes
+    $script:OpCounts = $Counts
+    $script:OpResumePaths = $ResumePaths
     $script:OpProgressRead = 0
+    $script:OpCurDirText = ''
+    $script:OpCurDirPath = ''
+    $script:OpMeasLogged = $false
+    $script:OpMeasStartLogged = $false
     $script:OpLastSizeAt = [DateTime]::MinValue
     $script:OpTotalBytes = $TotalBytes
-    $script:OpMeas = @{ Busy = $false; PS = $null; Ar = $null; CachePath = $null; DoneBytes = [int64]0; LastShown = '' }
+    $script:OpTotalFiles = [int64]0
+    if ($null -ne $Counts) {
+        foreach ($c in $Counts) { $script:OpTotalFiles += [int64]$c }
+    }
+    $script:OpMeas = @{ Busy = $false; PS = $null; Ar = $null; CachePath = $null; SizeBytes = [int64]0; FileTotal = [int64]0; FilesDoneBase = [int64]0; DoneBytes = [int64]0; LatestFile = ''; LastShown = '' }
 
     Set-OpUi -Busy $true
     $modeText = $(if ($Mode -eq 'Promote') { '提升到 SSD' } else { '回写机械盘' })
     $script:OpStatusLabel.Text = "准备中..."
+    # 立即把涉及路径放进清单（状态：正在缓存 / 正在回写）
+    try { Add-InventoryPending -Mode $Mode -Paths $Paths } catch { }
     Write-Log ("开始{0}，共 {1} 个目录，{2}。" -f $modeText, $Paths.Count, (Format-SizeGB $TotalBytes))
 
     # worker 逻辑：here-string 保存（单引号不插值），运行时与库源文本拼接。
@@ -746,24 +1110,129 @@ function Start-Operation {
 $out = New-Object System.Collections.Generic.List[object]
 $total = @($paths).Count
 $done = [int64]0
+$doneFiles = [int64]0
+$resumeList = @()
+if ($null -ne $resume) { $resumeList = @($resume) }
+$log = $null
+if ($root) { $log = Join-Path $root 'ssdcache.log' }
 for ($i = 0; $i -lt $total; $i++) {
     $p = @($paths)[$i]
     $sz = [int64]0
     if ($null -ne $sizes -and $i -lt @($sizes).Count) { $sz = [int64]@($sizes)[$i] }
+    $cnt = [int64]0
+    if ($null -ne $counts -and $i -lt @($counts).Count) { $cnt = [int64]@($counts)[$i] }
     $pct = [int](100 * $i / [Math]::Max($total, 1))
     try {
         if ($mode -eq 'Promote') {
-            $cp = Get-CachePathFor -SourcePath $p -CacheRoot $root
-            # CurrentOperation 编码供 UI 侧测量: 缓存路径|本目录字节|此前已完成字节
-            Write-Progress -Id 1 -Activity 'Promote' -Status ("[{0}/{1}] {2}" -f ($i + 1), $total, $p) -CurrentOperation ("{0}|{1}|{2}" -f $cp, $sz, $done) -PercentComplete $pct
-            $r = Invoke-CachePromote -SourcePath $p -CacheRoot $root
-            $done += $sz
-            $out.Add([pscustomobject]@{ Path = $p; Success = $true; AlreadyCached = $r.AlreadyCached; SizeBytes = $r.SizeBytes; Message = $r.Message })
+            $cp = Get-CachePathFor -SourcePath $p -Root $root
+            $resumed = $false
+            # 续传仅对显式候选（手动终止时正在处理的目录）生效：
+            # 缓存路径已存在也可能是子目录提升留下的宿主目录，不能据此判定为续传。
+            $isResume = $resumeList -contains $p
+            if ($isResume -and -not (Test-Junction -LiteralPath $p) -and (Test-Path -LiteralPath $cp)) {
+                # 断点续传：上次任务被手动终止，缓存目录已有部分数据。
+                # robocopy /E /MOVE 幂等：已复制的跳过，源侧剩余补齐，随后补建联接。
+                Write-Progress -Id 1 -Activity 'Promote' -Status ("[{0}/{1}] 续传 {2}" -f ($i + 1), $total, $p) -CurrentOperation ("{0}|{1}|{2}|{3}|{4}" -f $cp, $sz, $done, $cnt, $doneFiles) -PercentComplete $pct
+                if (Test-Path -LiteralPath $p) {
+                    $mv = Invoke-RoboMove -From $p -To $cp -LogPath $log
+                    if (-not $mv.Success) { throw ("续传失败（robocopy 代码 {0}）。数据分居两侧：{1} <-> {2}" -f $mv.Code, $p, $cp) }
+                }
+                New-MarkerFile -CachePath $cp -OriginalPath $p
+                if (Test-Path -LiteralPath $p) {
+                    # 指向自身缓存路径内部的子联接可安全删除：数据已在缓存里，
+                    # 父联接建立后经父路径解析到同一位置。
+                    $kids = @(Get-ChildItem -LiteralPath $p -Force -ErrorAction SilentlyContinue)
+                    foreach ($k in $kids) {
+                        if (($k.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                            $kt = $null
+                            try { $kt = Get-JunctionTarget -LiteralPath $k.FullName } catch { $kt = $null }
+                            if ($kt -and $kt.StartsWith($cp, [StringComparison]::OrdinalIgnoreCase)) {
+                                # 用 .NET API 而非 Remove-Item：终端防护会否决 cmdlet 删除重解析点
+                                try { [System.IO.Directory]::Delete($k.FullName, $false) } catch { }
+                            }
+                        }
+                    }
+                    $left = @(Get-ChildItem -LiteralPath $p -Force -ErrorAction SilentlyContinue)
+                    if ($left.Count -eq 0) {
+                        try { Remove-Item -LiteralPath $p -Force -Recurse -ErrorAction SilentlyContinue } catch { }
+                        if (Test-Path -LiteralPath $p) { try { [System.IO.Directory]::Delete($p, $false) } catch { } }
+                    }
+                }
+                if (-not (Test-Junction -LiteralPath $p)) {
+                    try {
+                        New-Item -ItemType Junction -Path $p -Value $cp -ErrorAction Stop | Out-Null
+                    } catch {
+                        $rb = Invoke-RoboMove -From $cp -To $p -LogPath $log
+                        $keepNote = ''
+                        if ($rb.Success) {
+                            # 绝不在缓存树仍有文件时递归删除：源端含指向缓存内部的
+                            # 子联接时数据无法写回，盲目删除会造成不可恢复的数据丢失。
+                            $leftFiles = @(Get-ChildItem -LiteralPath $cp -Recurse -File -Force -ErrorAction SilentlyContinue)
+                            if ($leftFiles.Count -eq 0) {
+                                Remove-Item -LiteralPath $cp -Recurse -Force -ErrorAction SilentlyContinue
+                            } else {
+                                $keepNote = (" 部分数据无法写回，已保留在缓存中，请勿删除：{0}" -f $cp)
+                            }
+                        }
+                        throw ("续传后建联接失败，数据已回滚到 {0}。{1} 原因: {2}" -f $p, $keepNote, $_.Exception.Message)
+                    }
+                }
+                $done += $sz
+                $doneFiles += $cnt
+                $out.Add([pscustomobject]@{ Path = $p; Success = $true; AlreadyCached = $false; SizeBytes = [int64]$sz; Message = '已从断点续传完成提升。'; CacheCleanupError = $null })
+                $resumed = $true
+            }
+            if (-not $resumed) {
+                # CurrentOperation 编码供 UI 侧测量: 缓存路径|本目录字节|此前已完成字节|本目录文件数|此前已完成文件数
+                Write-Progress -Id 1 -Activity 'Promote' -Status ("[{0}/{1}] {2}" -f ($i + 1), $total, $p) -CurrentOperation ("{0}|{1}|{2}|{3}|{4}" -f $cp, $sz, $done, $cnt, $doneFiles) -PercentComplete $pct
+                $r = Invoke-CachePromote -SourcePath $p -CacheRoot $root
+                $done += $sz
+                $doneFiles += $cnt
+                $out.Add([pscustomobject]@{ Path = $p; Success = $true; AlreadyCached = $r.AlreadyCached; SizeBytes = $r.SizeBytes; Message = $r.Message; CacheCleanupError = $null })
+            }
         } else {
-            Write-Progress -Id 1 -Activity 'Demote' -Status ("[{0}/{1}] {2}" -f ($i + 1), $total, $p) -CurrentOperation ("{0}|{1}|{2}" -f $p, $sz, $done) -PercentComplete $pct
-            $r = Invoke-CacheDemote -SourcePath $p -CacheRoot $root
-            $done += $sz
-            $out.Add([pscustomobject]@{ Path = $p; Success = $true; AlreadyCached = (-not $r.WasCached); SizeBytes = $r.SizeBytes; Message = $r.Message; CacheCleanupError = $r.CacheCleanupError })
+            if (-not (Test-Junction -LiteralPath $p)) {
+                $cp = Get-CachePathFor -SourcePath $p -Root $root
+                if (Test-Path -LiteralPath $cp) {
+                    # 断点续传（回写）：联接点已被拆除但数据分居两侧。
+                    # 仅当缓存目录的标记文件（或回写前被移入 TEMP 的标记）确认归属时才继续，
+                    # 防止把无关目录误搬进用户文件夹。
+                    Write-Progress -Id 1 -Activity 'Demote' -Status ("[{0}/{1}] 续传 {2}" -f ($i + 1), $total, $p) -CurrentOperation ("{0}|{1}|{2}" -f $p, $sz, $done) -PercentComplete $pct
+                    $meta = $null
+                    $marker = Join-Path $cp (Get-MarkerName)
+                    if (Test-Path -LiteralPath $marker) {
+                        try { $meta = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json } catch { $meta = $null }
+                    }
+                    if ($null -eq $meta) {
+                        $parked = @(Get-ChildItem -LiteralPath $env:TEMP -Filter 'ssdcache_marker_*.json' -File -ErrorAction SilentlyContinue)
+                        foreach ($f in $parked) {
+                            try {
+                                $m2 = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
+                                if ($m2.OriginalPath -eq $p) { $meta = $m2; break }
+                            } catch { }
+                        }
+                    }
+                    if ($null -eq $meta -or $meta.OriginalPath -ne $p) {
+                        throw ("缓存目录存在但标记无法确认归属，拒绝续传以免误搬数据: {0}" -f $cp)
+                    }
+                    $mv = Invoke-RoboMove -From $cp -To $p -LogPath $log
+                    if (-not $mv.Success) { throw ("回写续传失败（robocopy 代码 {0}）。数据保留在缓存 {1}" -f $mv.Code, $cp) }
+                    $null = Remove-LeakedMarkers -Root $p
+                    Remove-CacheFolderSafe -LiteralPath $cp | Out-Null
+                    if ($root) { Remove-EmptyParents -StartDir (Split-Path -Parent $cp) -Root $root | Out-Null }
+                    $done += $sz
+                    $out.Add([pscustomobject]@{ Path = $p; Success = $true; AlreadyCached = $false; SizeBytes = [int64]$sz; Message = '已从断点续传完成回写。'; CacheCleanupError = $null })
+                } else {
+                    Write-Progress -Id 1 -Activity 'Demote' -Status ("[{0}/{1}] {2}" -f ($i + 1), $total, $p) -CurrentOperation ("{0}|{1}|{2}" -f $p, $sz, $done) -PercentComplete $pct
+                    $done += $sz
+                    $out.Add([pscustomobject]@{ Path = $p; Success = $true; AlreadyCached = $true; SizeBytes = [int64]0; Message = '不是联接点且无缓存残留，跳过。'; CacheCleanupError = $null })
+                }
+            } else {
+                Write-Progress -Id 1 -Activity 'Demote' -Status ("[{0}/{1}] {2}" -f ($i + 1), $total, $p) -CurrentOperation ("{0}|{1}|{2}" -f $p, $sz, $done) -PercentComplete $pct
+                $r = Invoke-CacheDemote -SourcePath $p -CacheRoot $root
+                $done += $sz
+                $out.Add([pscustomobject]@{ Path = $p; Success = $true; AlreadyCached = (-not $r.WasCached); SizeBytes = $r.SizeBytes; Message = $r.Message; CacheCleanupError = $r.CacheCleanupError })
+            }
         }
     } catch {
         $out.Add([pscustomobject]@{ Path = $p; Success = $false; AlreadyCached = $false; SizeBytes = [int64]0; Message = $_.Exception.Message; CacheCleanupError = $null })
@@ -772,7 +1241,7 @@ for ($i = 0; $i -lt $total; $i++) {
 Write-Progress -Id 1 -Activity 'SSD' -Completed
 return $out.ToArray()
 '@
-    $opScript = 'param($mode, $paths, $root, $sizes)' + [Environment]::NewLine + $script:LibSource + [Environment]::NewLine + $workerBody
+    $opScript = 'param($mode, $paths, $root, $sizes, $counts, $resume)' + [Environment]::NewLine + $script:LibSource + [Environment]::NewLine + $workerBody
 
     $ps = [powershell]::Create()
     $null = $ps.AddScript($opScript)
@@ -780,6 +1249,8 @@ return $out.ToArray()
     $null = $ps.AddArgument($Paths)
     $null = $ps.AddArgument($Root)
     $null = $ps.AddArgument($Sizes)
+    $null = $ps.AddArgument($Counts)
+    $null = $ps.AddArgument($ResumePaths)
 
     $script:OpPS = $ps
     $script:OpAsyncResult = $ps.BeginInvoke()
@@ -795,17 +1266,38 @@ function Start-OpMeasure {
     <#
       在独立 runspace 中测量目录当前大小。测量遍历文件树，若在 UI 线程
       做会冻结界面；若在 worker 里做会与 robocopy 争抢 IO。专用短命
-      runspace 每 3 秒一次，开销可控且两不干扰。
+      runspace 每 3 秒一次（节流由 Poll-Operation 用 OpLastSizeAt 控制），
+      开销可控且两不干扰。
+
+      必须置 Busy = $true：Poll-Operation 只在 Busy 期间消费测量结果，
+      漏掉它会让测量值永远无法反映到进度条上。
     #>
     param([string]$Dir)
 
-    $measureScript = 'param($measureDir)' + [Environment]::NewLine + $script:LibSource + [Environment]::NewLine + 'Get-DirSize -LiteralPath $measureDir'
+    $measureScript = 'param($measureDir)' + [Environment]::NewLine + $script:LibSource + [Environment]::NewLine + 'Get-DirStats -LiteralPath $measureDir'
     $ps = [powershell]::Create()
     $null = $ps.AddScript($measureScript)
     $null = $ps.AddArgument($Dir)
-    $null = $ps.AddArgument($Dir)
     $script:OpMeas.PS = $ps
-    $script:OpMeas.Ar = $ps.BeginInvoke()
+    $script:OpMeas.Busy = $true
+    try {
+        $script:OpMeas.Ar = $ps.BeginInvoke()
+    } catch {
+        # BeginInvoke 同步失败：不让异常冒到 Poll 的兜底 catch（那会直接结束任务），
+        # 复位状态并记一次日志，下一轮再试。
+        $script:OpMeas.Busy = $false
+        $script:OpMeas.PS = $null
+        $script:OpMeas.Ar = $null
+        if (-not $script:OpMeasLogged) {
+            $script:OpMeasLogged = $true
+            Write-Log ("进度测量无法启动（详细文件进度不可用）：" + $_.Exception.Message) '警告'
+        }
+        return
+    }
+    if (-not $script:OpMeasStartLogged) {
+        $script:OpMeasStartLogged = $true
+        Write-Log ("进度测量已启动：{0}" -f $Dir)
+    }
 }
 
 function Poll-Operation {
@@ -814,55 +1306,138 @@ function Poll-Operation {
         if ($null -eq $script:OpPS) { return }
 
         # 1) 消费新增的进度记录
+        #
+        #    只认本任务自己写的记录（-Id 1 且 Activity 为 Promote/Demote）。
+        #    runspace 里模块自动加载也会写进度记录：实测出现过
+        #       ActivityId=0        「正在准备首次使用模块。」
+        #       ActivityId=509923147「Get-Volume -DriveLetter ... / 已完成 1/1」
+        #    这些记录的 CurrentOperation 是空的。如果按"本 tick 最后一条"解析，
+        #    当它们与我们的记录落在同一个 700ms 窗口内时，缓存路径永远拿不到，
+        #    后台测量一次都不会启动 —— 表现为进度条恒 0%、文件数空白、
+        #    明细行显示"已完成 1/1"。这就是本 bug 的根因。
         $prog = $script:OpPS.Streams.Progress
-        $cur = $null
+        $opText = $(if ($script:OpMode -eq 'Promote') { '提升' } else { '回写' })
         while ($script:OpProgressRead -lt @($prog).Count) {
             $rec = $prog[$script:OpProgressRead]
             $script:OpProgressRead++
             if ($null -eq $rec) { continue }
-            $cur = $rec
-            if ($rec.PercentComplete -ge 0) {
-                # 目录级进度仅作兜底显示；真实进度由测量数据计算
-                $opText = $(if ($script:OpMode -eq 'Promote') { '提升' } else { '回写' })
-                $script:OpStatusLabel.Text = "$opText 中   " + $rec.StatusDescription
+            if ($rec.ActivityId -ne 1) { continue }
+            if ($rec.Activity -ne 'Promote' -and $rec.Activity -ne 'Demote') { continue }
+
+            # 目录序号与源路径：StatusDescription 形如 "[1/2] F:\Game\X" 或 "[1/2] 续传 F:\Game\X"
+            if ($rec.StatusDescription) {
+                $script:OpCurDirText = $rec.StatusDescription
+                if ($rec.StatusDescription -match '^\[(\d+)/(\d+)\]\s*(?:续传\s*)?(.+)$') {
+                    $script:OpCurDirPath = $matches[3].Trim()
+                    $script:OpStatusLabel.Text = ("{0} 中   第 {1}/{2} 个目录 {3}" -f $opText, $matches[1], $matches[2], $script:OpCurDirPath)
+                }
+            }
+
+            # 编码串：缓存路径|本目录字节|此前已完成字节|本目录文件数|此前已完成文件数
+            if ($rec.CurrentOperation -and $rec.CurrentOperation.Contains('|')) {
+                $parts = ($rec.CurrentOperation -split '\|')
+                if ($parts.Count -ge 3) {
+                    if ($parts[0] -ne $script:OpMeas.CachePath) { $script:OpMeas.LatestFile = '' }
+                    $script:OpMeas.CachePath = $parts[0]
+                    $script:OpMeas.SizeBytes = [int64]$parts[1]
+                    $script:OpMeas.DoneBytes = [int64]$parts[2]
+                }
+                if ($parts.Count -ge 5) {
+                    $script:OpMeas.FileTotal = [int64]$parts[3]
+                    $script:OpMeas.FilesDoneBase = [int64]$parts[4]
+                }
             }
         }
 
-        $opText = $(if ($script:OpMode -eq 'Promote') { '提升' } else { '回写' })
-
-        # 2) 从最新进度记录解析当前目录的测量参数
-        if ($null -ne $cur -and $cur.CurrentOperation) {
-            $parts = ($cur.CurrentOperation -split '\|')
-            if ($parts.Count -ge 3) {
-                $script:OpMeas.CachePath = $parts[0]
-                $script:OpMeas.SizeBytes = [int64]$parts[1]
-                $script:OpMeas.DoneBytes = [int64]$parts[2]
+        # 2) 测量目标：优先用 worker 编码的缓存路径；缺失时由 UI 自己推导，
+        #    避免任何一条记录的字段异常把整条进度链路掐死。
+        $m = $script:OpMeas
+        if (-not $m.CachePath -and $script:OpCurDirPath) {
+            if ($script:OpMode -eq 'Promote') {
+                try { $m.CachePath = Get-CachePathFor -SourcePath $script:OpCurDirPath -Root $script:OpCacheRoot } catch { }
+            } else {
+                $m.CachePath = $script:OpCurDirPath
             }
         }
 
         # 3) 数据量进度：后台测量"当前目录已写入量"，与已完成字节合并
-        $m = $script:OpMeas
         if ($m.Busy -and $null -ne $m.Ar -and $m.Ar.IsCompleted) {
-            $measured = [int64]0
-            try { $measured = [int64]($m.PS.EndInvoke($m.Ar)) } catch { $measured = [int64]0 }
+            $mSize = [int64]0
+            $mFiles = [int64]0
+            $mCurFile = ''
+            try {
+                $tmp = $m.PS.EndInvoke($m.Ar)
+                if ($null -ne $tmp) { $tmp = @($tmp)[0] }
+                if ($null -ne $tmp) {
+                    $pSize = $tmp.PSObject.Properties['SizeBytes']
+                    $pFiles = $tmp.PSObject.Properties['FileCount']
+                    $pNewest = $tmp.PSObject.Properties['NewestFile']
+                    if ($pSize) { $mSize = [int64]$pSize.Value }
+                    if ($pFiles) { $mFiles = [int64]$pFiles.Value }
+                    if ($pNewest -and $pNewest.Value) { $mCurFile = [string]$pNewest.Value }
+                }
+            } catch {
+                $mSize = [int64]0; $mFiles = [int64]0; $mCurFile = ''
+                if (-not $script:OpMeasLogged) {
+                    $script:OpMeasLogged = $true
+                    Write-Log ("进度测量失败（详细文件进度不可用）：" + $_.Exception.Message) '警告'
+                }
+            }
+            if ($mCurFile) { $m.LatestFile = $mCurFile } else { $mCurFile = [string]$m.LatestFile }
             try { $m.PS.Dispose() } catch { }
             $m.PS = $null; $m.Ar = $null; $m.Busy = $false
 
             if ($script:OpMode -eq 'Promote' -and $script:OpTotalBytes -gt 0) {
-                $doneAll = $m.DoneBytes + [Math]::Min($measured, $m.SizeBytes)
+                $doneAll = $m.DoneBytes + [Math]::Min($mSize, $m.SizeBytes)
                 $pct = [int](100 * $doneAll / $script:OpTotalBytes)
                 $pct = [Math]::Min(99, [Math]::Max(0, $pct))
                 $script:ProgressBar.Value = $pct
-                $shown = ("{0} 进度 {1}%（已迁移 {2} / {3}）" -f $opText, $pct, (Format-SizeGB $doneAll), (Format-SizeGB $script:OpTotalBytes))
+                $script:PercentLabel.Text = ("{0}%" -f $pct)
+                # 右侧合计：字节 + 全部所选目录的文件数进度
+                $cntText = ("已迁移 {0} / {1}" -f (Format-SizeGB $doneAll), (Format-SizeGB $script:OpTotalBytes))
+                if ($script:OpTotalFiles -gt 0) {
+                    $curFiles = [Math]::Min($mFiles, $m.FileTotal)
+                    $allFiles = [int64]$m.FilesDoneBase + $curFiles
+                    $cntText += (" · 文件 {0} / {1}" -f $allFiles, $script:OpTotalFiles)
+                }
+                $script:CountLabel.Text = $cntText
+                # 明细行：目录序号 + 本目录文件进度 + 正在复制的文件名
+                $leaf = ''
+                if ($mCurFile) { try { $leaf = [IO.Path]::GetFileName($mCurFile) } catch { $leaf = $mCurFile } }
+                $curFileText = ''
+                if ($leaf) { $curFileText = ' · 正在复制 ' + (Format-ShortName $leaf 48) }
+                $filesText = ''
+                if ($m.FileTotal -gt 0) {
+                    $filesText = (" · 本目录文件 {0}/{1}" -f [Math]::Min($mFiles, $m.FileTotal), $m.FileTotal)
+                }
+                $shown = ("{0}中 {1}{2}{3}" -f $opText, $script:OpCurDirText, $filesText, $curFileText)
                 if ($shown -ne $m.LastShown) {
                     $m.LastShown = $shown
                     $script:OpStatusLabel.Text = $shown
                 }
             } elseif ($script:OpMode -eq 'Demote') {
-                $script:OpStatusLabel.Text = ("回写中   [已恢复 {0}]" -f (Format-SizeGB ($m.DoneBytes + $measured)))
+                # 回写同样按数据量推进进度条（此前回写期间进度条一直是 0%）
+                $doneAll = $m.DoneBytes + [Math]::Min($mSize, $m.SizeBytes)
+                if ($script:OpTotalBytes -gt 0) {
+                    $pct = [int](100 * $doneAll / $script:OpTotalBytes)
+                    $pct = [Math]::Min(99, [Math]::Max(0, $pct))
+                    $script:ProgressBar.Value = $pct
+                    $script:PercentLabel.Text = ("{0}%" -f $pct)
+                }
+                $script:CountLabel.Text = ("已恢复 {0} / {1} · 文件 {2}" -f (Format-SizeGB $doneAll), (Format-SizeGB $script:OpTotalBytes), $mFiles)
+                $leaf = ''
+                if ($mCurFile) { try { $leaf = [IO.Path]::GetFileName($mCurFile) } catch { $leaf = $mCurFile } }
+                $curFileText = ''
+                if ($leaf) { $curFileText = ' · 正在写回 ' + (Format-ShortName $leaf 48) }
+                $shown = ("回写中 {0}{1}" -f $script:OpCurDirText, $curFileText)
+                if ($shown -ne $m.LastShown) {
+                    $m.LastShown = $shown
+                    $script:OpStatusLabel.Text = $shown
+                }
             }
         }
-        if (-not $m.Busy -and $m.CachePath -and (Test-Path -LiteralPath $m.CachePath)) {
+        if (-not $m.Busy -and $m.CachePath -and ((Get-Date) - $script:OpLastSizeAt).TotalSeconds -ge 2 -and (Test-Path -LiteralPath $m.CachePath)) {
+            $script:OpLastSizeAt = Get-Date
             Start-OpMeasure -Dir $m.CachePath
         }
 
@@ -886,20 +1461,7 @@ function Poll-Operation {
 function Finish-Operation {
     param([object[]]$Results, [string]$Error)
 
-    try {
-        if ($null -ne $script:OpTimer) { $script:OpTimer.Stop(); $script:OpTimer.Dispose() }
-    } catch { }
-    try {
-        if ($null -ne $script:OpPS) { $script:OpPS.Dispose() }
-    } catch { }
-    try {
-        if ($null -ne $script:OpMeas.PS) { $script:OpMeas.PS.Dispose() }
-    } catch { }
-    $script:OpPS = $null
-    $script:OpAsyncResult = $null
-    $script:OpMeas.Busy = $false
-    $script:OpMeas.PS = $null
-    $script:OpMeas.Ar = $null
+    Reset-OpRuntime
     $state.OpBusy = $false
 
     $okCount = 0
@@ -910,7 +1472,12 @@ function Finish-Operation {
                 Write-Log ("{0}：已是缓存目录，跳过。" -f $r.Path) '警告'
             } else {
                 Write-Log ("{0}：{1}" -f $r.Path, $r.Message) '完成'
-                if ($r.CacheCleanupError) {
+                # 防御式读取：exe 内联库源后 Set-StrictMode 作用于全局，
+                # 直接访问不存在的属性会抛错并中断整个收尾流程。
+                $ccErr = $null
+                $ccProp = $r.PSObject.Properties['CacheCleanupError']
+                if ($ccProp) { $ccErr = $ccProp.Value }
+                if ($ccErr) {
                     Write-Log ("{0}：数据已就位，但缓存目录未能自动删除，可手动清理。" -f $r.Path) '警告'
                 }
             }
@@ -928,8 +1495,11 @@ function Finish-Operation {
     Write-Log ("{0}结束。成功 {1} 个，失败 {2} 个。" -f $modeText, $okCount, $failCount)
 
     $script:ProgressBar.Value = 100
+    $script:PercentLabel.Text = '100%'
+    $script:CountLabel.Text = ''
     $script:OpStatusLabel.Text = "完成：成功 $okCount / 失败 $failCount"
 
+    try { Complete-InventoryPending -Mode $script:OpMode -Results $Results } catch { }
     Set-OpUi -Busy $false
     Build-Tree
     Refresh-Inventory
@@ -937,20 +1507,7 @@ function Finish-Operation {
 
 function Stop-Operation {
     <# 窗体关闭时中止长任务。 #>
-    try {
-        if ($null -ne $script:OpTimer) { $script:OpTimer.Stop(); $script:OpTimer.Dispose() }
-    } catch { }
-    try {
-        if ($null -ne $script:OpPS -and $script:OpPS.InvocationStateInfo.State -eq 'Running') { $script:OpPS.Stop() }
-        if ($null -ne $script:OpPS) { $script:OpPS.Dispose() }
-    } catch { }
-    try {
-        if ($null -ne $script:OpMeas.PS) { $script:OpMeas.PS.Dispose() }
-    } catch { }
-    $script:OpPS = $null
-    $script:OpAsyncResult = $null
-    $script:OpMeas.PS = $null
-    $script:OpMeas.Ar = $null
+    Reset-OpRuntime
     Stop-InventoryScan
 }
 
@@ -961,6 +1518,39 @@ function Invoke-PromoteSelected {
         return
     }
 
+    # 只保留最顶层勾选：父目录被提升时子目录随数据一起进入缓存；
+    # 逐个提升会在父子之间产生联接/缓存路径冲突（F:\Books 案例的根因）。
+    $topLevel = @()
+    foreach ($c in $checked) {
+        $isDescendant = $false
+        $cp2 = $c.Path.TrimEnd('\')
+        foreach ($o in $checked) {
+            if ($o.Path -ne $c.Path) {
+                $op2 = $o.Path.TrimEnd('\')
+                if ($cp2.StartsWith($op2 + '\', [StringComparison]::OrdinalIgnoreCase)) { $isDescendant = $true; break }
+            }
+        }
+        if (-not $isDescendant) { $topLevel += $c }
+    }
+    $checked = @($topLevel)
+
+    # 已被缓存中的父联接覆盖的目录跳过（数据已在 SSD 上）
+    $notCovered = @()
+    foreach ($c in $checked) {
+        $covered = $false
+        $node = Split-Path -Parent $c.Path.TrimEnd('\')
+        while ($node -and $node.Length -gt 3) {
+            if (Test-Junction -LiteralPath $node) { $covered = $true; break }
+            $node = Split-Path -Parent $node
+        }
+        if (-not $covered) { $notCovered += $c }
+    }
+    if ($notCovered.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('所选目录已通过其父目录处于加速状态，无需重复提升。', '无需提升') | Out-Null
+        return
+    }
+    $checked = @($notCovered)
+
     $root = $script:CacheRootBox.Text.Trim()
     if ([string]::IsNullOrWhiteSpace($root)) {
         [System.Windows.Forms.MessageBox]::Show('请先设置缓存根目录。', '缺少缓存根目录') | Out-Null
@@ -970,16 +1560,27 @@ function Invoke-PromoteSelected {
     Write-Log '正在统计所选文件夹大小（大目录可能需要一些时间）...'
     [System.Windows.Forms.Application]::DoEvents()
 
+    # 一次遍历同时拿到大小与文件数：大小用于总进度，文件数用于逐文件进度。
+    $paths = New-Object System.Collections.Generic.List[string]
+    $sizes = New-Object System.Collections.Generic.List[long]
+    $counts = New-Object System.Collections.Generic.List[long]
     $lines = @()
     $grand = 0
     foreach ($c in $checked) {
+        $sz = [int64]0
+        $cnt = [int64]0
         try {
-            $sz = Get-DirSize -LiteralPath $c.Path
-            $grand += $sz
-            $lines += ("  {0}   {1}" -f $c.Path, (Format-SizeGB $sz))
+            $st = Get-DirStats -LiteralPath $c.Path
+            $sz = [int64]$st.SizeBytes
+            $cnt = [int64]$st.FileCount
+            $lines += ("  {0}   {1}（{2} 个文件）" -f $c.Path, (Format-SizeGB $sz), $cnt)
         } catch {
             $lines += ("  {0}   （无法读取）" -f $c.Path)
         }
+        $grand += $sz
+        $paths.Add([string]$c.Path)
+        $sizes.Add($sz)
+        $counts.Add($cnt)
         [System.Windows.Forms.Application]::DoEvents()
     }
 
@@ -987,14 +1588,7 @@ function Invoke-PromoteSelected {
     $ans = [System.Windows.Forms.MessageBox]::Show($msg, '确认提升', [System.Windows.Forms.MessageBoxButtons]::OKCancel, [System.Windows.Forms.MessageBoxIcon]::Question)
     if ($ans -ne [System.Windows.Forms.DialogResult]::OK) { Write-Log '已取消提升。'; return }
 
-    $paths = @($checked | ForEach-Object { $_.Path })
-    $sizes = New-Object System.Collections.Generic.List[long]
-    foreach ($p in $paths) {
-        $sz = [int64]0
-        try { $sz = Get-DirSize -LiteralPath $p } catch { $sz = [int64]0 }
-        $sizes.Add($sz)
-    }
-    Start-Operation -Mode 'Promote' -Paths $paths -Root $root -Sizes $sizes.ToArray() -TotalBytes $grand
+    Start-Operation -Mode 'Promote' -Paths $paths.ToArray() -Root $root -Sizes $sizes.ToArray() -Counts $counts.ToArray() -TotalBytes $grand
 }
 
 function Invoke-DemoteSelected {
@@ -1008,6 +1602,18 @@ function Invoke-DemoteSelected {
     foreach ($c in $checked) {
         if (Test-Junction -LiteralPath $c.Path) { $cached += $c.Path }
     }
+    # 只回写最顶层联接：子联接的数据位于父缓存目录内部，回写父目录时一并恢复；
+    # 先回写子联接会掏空父缓存目录，随后父目录回写会报「目标丢失」。
+    $topMost = @()
+    foreach ($p in $cached) {
+        $isDescendant = $false
+        $pn = $p.TrimEnd('\')
+        foreach ($q in $cached) {
+            if ($q -ne $p -and $pn.StartsWith($q.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { $isDescendant = $true; break }
+        }
+        if (-not $isDescendant) { $topMost += $p }
+    }
+    $cached = @($topMost)
     if ($cached.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show('勾选的文件夹中没有处于缓存状态的目录。', '无需回写') | Out-Null
         return
@@ -1092,11 +1698,28 @@ $script:Tree.add_AfterCheck({
 $script:Tree.add_BeforeExpand({ param($s, $e) Expand-Node -Node $e.Node })
 
 # 分割位置只能在容器获得实际尺寸之后设置，因此放在 Shown 事件里。
+# 每一步独立 try/catch：exe 内联库源后 Set-StrictMode 作用于全局，
+# 前面任何一步抛错都会吞掉后续步骤——曾导致打开时自动扫描不执行。
 $form.add_Shown({
-    Apply-SplitterDistances -Form $form
-    Build-Tree
-    Write-Log '就绪。请展开磁盘并勾选要加速的文件夹。'
-    Refresh-Inventory
+    # 版本 + 运行文件：远程排查先确认"跑的是哪个构建"（标题栏同样带版本号）
+    try {
+        $runPath = ''
+        try { $runPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { }
+        if (-not $runPath) { try { $runPath = $PSCommandPath } catch { $runPath = '未知' } }
+        Write-Log ("SSD 缓存管理器 v{0} 启动（PowerShell {1}，运行文件：{2}）" -f $script:AppVersion, $PSVersionTable.PSVersion, $runPath)
+    } catch { }
+    # 先显示上次扫描的快照（秒开），再启动后台全量扫描校正
+    try {
+        $snap = @(Load-InventoryCache)
+        if ($snap.Count -gt 0) {
+            Update-InventoryUi -Items $snap
+            Write-Log ("已从本地快照载入 {0} 个缓存目录，正在后台校正…" -f $snap.Count)
+        }
+    } catch { }
+    try { Refresh-Inventory } catch { Write-Log ("启动扫描失败：" + $_.Exception.Message) '错误' }
+    try { Apply-SplitterDistances -Form $form } catch { }
+    try { Build-Tree } catch { }
+    Write-Log '就绪。已开始后台扫描缓存目录，可展开磁盘并勾选要加速的文件夹。'
 })
 
 $form.add_Resize({
